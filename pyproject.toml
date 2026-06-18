@@ -1,0 +1,86 @@
+[tool.poetry]
+name = "credit-scoring"
+version = "0.1.0"
+description = "Credit default prediction from credit history sequences"
+authors = ["Stepan [bazhenov.stepan1@gmail.com](mailto:bazhenov.stepan1@gmail.com)"]
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+
+# Data processing
+
+numpy = "^2.1.0"
+pandas = "^2.2.0"
+polars = "^1.17.0"
+pyarrow = "^18.1.0"
+scipy = "^1.14.0"
+
+# Machine learning
+
+scikit-learn = "^1.5.0"
+catboost = "^1.2.7"
+lightgbm = "^4.5.0"
+
+# Deep learning
+
+torch = { version = ">=2.8.0", source = "pytorch-cu128" }
+torchvision = { version = ">=0.23.0", source = "pytorch-cu128" }
+torchaudio = { version = ">=2.8.0", source = "pytorch-cu128", optional = true }
+
+torchmetrics = "^1.6.0"
+pytorch-lightning = "^2.5.0"
+
+# Configs and utils
+
+pyyaml = "^6.0.2"
+omegaconf = "^2.3.0"
+hydra-core = "^1.3.2"
+tqdm = "^4.67.0"
+joblib = "^1.4.2"
+loguru = "^0.7.3"
+rich = "^13.9.0"
+
+# Visualization and EDA
+
+matplotlib = "^3.9.0"
+seaborn = "^0.13.2"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.0"
+pytest-cov = "^6.0.0"
+ipykernel = "^6.29.0"
+jupyter = "^1.1.1"
+ruff = "^0.8.0"
+pre-commit = "^4.0.0"
+mypy = "^1.14.0"
+
+[[tool.poetry.source]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+priority = "explicit"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_return_any = false
+disallow_untyped_defs = false
+check_untyped_defs = true
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

@@ -17,7 +17,7 @@ def resolve_device(device=None):
         return device
     if device is not None:
         return torch.device(device)
-    return torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 def train_sequence_model(

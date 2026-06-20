@@ -1,13 +1,17 @@
 import inspect
+import json
 from pathlib import Path
 from pprint import pformat
 
+import joblib
 import numpy as np
 import pandas as pd
 import torch
 from catboost import CatBoostClassifier
-from sklearn.metrics import roc_auc_score
+from sklearn.linear_model import Ridge
+from sklearn.metrics import explained_variance_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
 
 from config import CAT_COLS, TrainingConfig
 from features_creator import extract_client_features
@@ -215,6 +219,8 @@ class ModelRunner:
             return self._run_static_catboost()
         if self.model_cfg["type"] == "neural_embeddings_catboost":
             return self._run_neural_embeddings_catboost()
+        if self.model_cfg["type"] == "orthogonalized_embeddings_catboost":
+            return self._run_orthogonalized_embeddings_catboost()
         if self.model_cfg["type"] == "cross_attention_fusion_mlp":
             return self._run_cross_attention_fusion_mlp()
         raise ValueError(f"Unknown model type: {self.model_cfg['type']}")
@@ -547,6 +553,135 @@ class ModelRunner:
             scores=scores,
         )
 
+    def _run_orthogonalized_embeddings_catboost(self):
+        cfg = self._training_config()
+        device = resolve_device(cfg.device)
+        train_sequences, test_sequences = build_sequences(
+            self.train_data_path, self.test_data_path,
+            chunk_size=self.model_cfg.get("sequence_chunk_size", 500_000),
+        )
+        train_df, test_df = self._base_train_frame(), self._base_test_frame()
+        y = train_df["flag"].astype(int).reset_index(drop=True)
+        ids = train_df["id"].astype(int).values
+        test_ids = test_df["id"].astype(int).values
+        skf = StratifiedKFold(cfg.n_splits, shuffle=True, random_state=cfg.random_state)
+        oof = np.zeros(len(train_df), dtype=np.float32)
+        test_pred = np.zeros(len(test_df), dtype=np.float32)
+        scores = []
+        id_to_pos = pd.Series(np.arange(len(ids)), index=ids)
+        alpha = float(self.model_cfg.get("ridge_alpha", 100.0))
+        gamma = float(self.model_cfg.get("residual_gamma", 1.0))
+        if not 0.0 <= gamma <= 1.0:
+            raise ValueError(f"residual_gamma must be in [0, 1], got {gamma}")
+        print(f"{self.name}: ridge OOF | folds={cfg.n_splits}, alpha={alpha}, gamma={gamma}")
+
+        for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y), 1):
+            fold_dir = self.output_dir / "models" / self.name / f"fold_{fold}"
+            fold_dir.mkdir(parents=True, exist_ok=True)
+            train_ids, val_ids = ids[train_idx], ids[val_idx]
+            y_train, y_val = y.iloc[train_idx].values, y.iloc[val_idx].values
+            train_seq, train_targets, val_seq, val_targets = make_sequence_fold_data(
+                train_ids, val_ids, y_train, y_val, train_sequences
+            )
+            scale_pos_weight = _sequence_scale_pos_weight(train_targets)
+            train_kwargs = dict(
+                train_sequences=train_seq, train_targets=train_targets,
+                val_sequences=val_seq, val_targets=val_targets,
+                epochs=cfg.transformer_epochs, scale_pos_weight=scale_pos_weight,
+                batch_size=cfg.batch_size_sequences, device=device,
+            )
+            transformer = train_sequence_model(
+                **train_kwargs,
+                model_factory=self.model_cfg.get(
+                    "transformer_model_factory", create_transformer_model
+                ),
+            )
+            bilstm = train_sequence_model(
+                **train_kwargs,
+                model_factory=self.model_cfg.get("bilstm_model_factory", create_bilstm_model),
+            )
+            batch_size = self.model_cfg.get("embedding_batch_size", 2048)
+            embeddings = {}
+            for name, sequences, expected_ids in (
+                ("train", train_seq, train_ids), ("val", val_seq, val_ids),
+                ("test", test_sequences, test_ids),
+            ):
+                tr = extract_sequence_embeddings(
+                    transformer, sequences, prefix="transformer_emb",
+                    batch_size=batch_size, device=device,
+                )
+                lstm = extract_sequence_embeddings(
+                    bilstm, sequences, prefix="bilstm_emb",
+                    batch_size=batch_size, device=device,
+                )
+                embeddings[name] = _align_paired_embeddings(tr, lstm, expected_ids, name)
+
+            tr_scaler, lstm_scaler = StandardScaler(), StandardScaler()
+            tr_train = tr_scaler.fit_transform(embeddings["train"][0])
+            lstm_train = lstm_scaler.fit_transform(embeddings["train"][1])
+            tr_val = tr_scaler.transform(embeddings["val"][0])
+            lstm_val = lstm_scaler.transform(embeddings["val"][1])
+            tr_test = tr_scaler.transform(embeddings["test"][0])
+            lstm_test = lstm_scaler.transform(embeddings["test"][1])
+            ridge = Ridge(alpha=alpha).fit(tr_train, lstm_train)
+            pred_train, pred_val, pred_test = (
+                ridge.predict(tr_train), ridge.predict(tr_val), ridge.predict(tr_test)
+            )
+            res_train = lstm_train - gamma * pred_train
+            res_val = lstm_val - gamma * pred_val
+            res_test = lstm_test - gamma * pred_test
+            X_train = _make_orthogonalized_feature_frame(tr_train, res_train)
+            X_val = _make_orthogonalized_feature_frame(tr_val, res_val)
+            X_test = _make_orthogonalized_feature_frame(tr_test, res_test)
+            _, val_pred, fold_test_pred, score = fit_catboost_fold(
+                X_train=X_train, y_train=y_train, X_val=X_val, y_val=y_val,
+                X_test=X_test, model_path=fold_dir / "catboost.cbm",
+                train_dir=fold_dir / "catboost_train_dir", config=cfg,
+                task_type=self.model_cfg.get("task_type", "GPU"), cat_features=[],
+                model_factory=self.model_cfg.get("final_model_factory", create_catboost_model),
+            )
+            oof[id_to_pos.loc[embeddings["val"][2]].values] = val_pred
+            test_pred += fold_test_pred / cfg.n_splits
+            scores.append(score)
+            torch.save({
+                "transformer_state_dict": _state_dict_to_cpu(transformer),
+                "bilstm_state_dict": _state_dict_to_cpu(bilstm),
+            }, fold_dir / "sequence_models.pt")
+            joblib.dump(tr_scaler, fold_dir / "transformer_scaler.joblib")
+            joblib.dump(lstm_scaler, fold_dir / "bilstm_scaler.joblib")
+            joblib.dump(ridge, fold_dir / "ridge.joblib")
+            metrics = {
+                "fold": fold, "alpha": alpha, "gamma": gamma, "fold_auc": float(score),
+                "explained_variance": {
+                    "train": float(explained_variance_score(
+                        lstm_train, pred_train, multioutput="variance_weighted")),
+                    "val": float(explained_variance_score(
+                        lstm_val, pred_val, multioutput="variance_weighted")),
+                },
+                "mean_l2_norm": {
+                    "train": _embedding_norm_metrics(
+                        embeddings["train"], tr_train, lstm_train, res_train
+                    ),
+                    "val": _embedding_norm_metrics(embeddings["val"], tr_val, lstm_val, res_val),
+                    "test": _embedding_norm_metrics(
+                        embeddings["test"], tr_test, lstm_test, res_test
+                    ),
+                },
+                "n_train": len(X_train), "n_val": len(X_val),
+                "n_test": len(X_test), "n_features": X_train.shape[1],
+            }
+            with (fold_dir / "metrics.json").open("w", encoding="utf-8") as file:
+                json.dump(metrics, file, ensure_ascii=False, indent=2)
+            print(f"{self.name} fold {fold}: auc={score:.6f}, "
+                  f"EV train={metrics['explained_variance']['train']:.6f}, "
+                  f"EV val={metrics['explained_variance']['val']:.6f}")
+            del transformer, bilstm
+            torch.cuda.empty_cache()
+
+        return _runner_result_from_arrays(
+            self.name, ids, y.values, test_ids, oof, test_pred, scores
+        )
+
     def _train_sequence_model(
         self,
         train_fold_sequences,
@@ -648,6 +783,46 @@ class ModelRunner:
 
     def _base_test_frame(self):
         return self.test_id_df[["id"]].copy()
+
+
+def _align_paired_embeddings(transformer_df, bilstm_df, expected_ids, split_name):
+    expected = pd.DataFrame({"id": np.asarray(expected_ids, dtype=int)})
+    if expected["id"].duplicated().any():
+        raise ValueError(f"Duplicate expected ids in {split_name}")
+    if transformer_df["id"].duplicated().any() or bilstm_df["id"].duplicated().any():
+        raise ValueError(f"Duplicate embedding ids in {split_name}")
+    tr_cols = [col for col in transformer_df if col != "id"]
+    lstm_cols = [col for col in bilstm_df if col != "id"]
+    paired = expected.merge(transformer_df, on="id", how="left", validate="one_to_one")
+    paired = paired.merge(bilstm_df, on="id", how="left", validate="one_to_one")
+    if paired[tr_cols + lstm_cols].isna().to_numpy().any():
+        missing = paired.loc[paired[tr_cols + lstm_cols].isna().any(axis=1), "id"]
+        raise ValueError(f"Missing {split_name} embeddings for ids: {missing.head(10).tolist()}")
+    return (paired[tr_cols].to_numpy(np.float32), paired[lstm_cols].to_numpy(np.float32),
+            paired["id"].to_numpy(int))
+
+
+def _make_orthogonalized_feature_frame(transformer, residual):
+    columns = ([f"transformer_scaled_{i}" for i in range(transformer.shape[1])] +
+               [f"bilstm_residual_{i}" for i in range(residual.shape[1])])
+    return pd.DataFrame(np.concatenate([transformer, residual], axis=1).astype(np.float32),
+                        columns=columns)
+
+
+def _mean_l2_norm(values):
+    return float(np.linalg.norm(values, axis=1).mean())
+
+
+def _embedding_norm_metrics(raw_pair, transformer, bilstm, residual):
+    return {"transformer_raw": _mean_l2_norm(raw_pair[0]),
+            "bilstm_raw": _mean_l2_norm(raw_pair[1]),
+            "transformer_scaled": _mean_l2_norm(transformer),
+            "bilstm_scaled": _mean_l2_norm(bilstm),
+            "bilstm_residual": _mean_l2_norm(residual)}
+
+
+def _state_dict_to_cpu(model):
+    return {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
 
 
 def train_meta_model(runner_results, train_target_df, test_ids, config, output_dir):
